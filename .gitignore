@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Biometric / personal data - never commit real faces or their encodings
+data/input/*
+!data/input/.gitkeep
+output/*
+!output/.gitkeep
+tests/fixtures/
+
+# secrets (later pieces: API keys, wallet private key)
+.env
+
+# OS
+Thumbs.db
+.DS_Store
