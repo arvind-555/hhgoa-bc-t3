@@ -27,12 +27,14 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-import sys
 from pathlib import Path
 
 import face_recognition
 import numpy as np
 
+from pipeline_log import fail, get_logger, step
+
+log = get_logger("face_encoder")
 
 ENCODER_NAME = "face_recognition / dlib ResNet-29, 128-d"
 
@@ -91,18 +93,31 @@ def load_image(image_path: str | Path) -> tuple[Path, "np.ndarray"]:
         raise BadInput(f"file not found: {image_path}")
     if not image_path.is_file():
         raise BadInput(f"not a file: {image_path}")
-    try:
-        image = face_recognition.load_image_file(str(image_path))
-    except Exception as exc:  # PIL throws assorted errors on junk input
-        raise BadInput(f"could not read image {image_path.name}: {exc}") from exc
+    with step(log, f"Loading image {image_path}"):
+        try:
+            image = face_recognition.load_image_file(str(image_path))
+        except Exception as exc:  # PIL throws assorted errors on junk input
+            raise BadInput(f"could not read image {image_path.name}: {exc}") from exc
+    h, w = image.shape[0], image.shape[1]
+    log.info("Image loaded: %d x %d px, %.0f KB on disk",
+             w, h, image_path.stat().st_size / 1024)
     return image_path, image
 
 
 def detect_faces(image: "np.ndarray", model: str = "hog") -> list[tuple[int, int, int, int]]:
     """Return face boxes ordered left-to-right, then top-to-bottom."""
-    boxes = face_recognition.face_locations(image, model=model)
+    with step(log, f"Detecting faces (detector={model})"):
+        boxes = face_recognition.face_locations(image, model=model)
     # box = (top, right, bottom, left); sort by left, then top
-    return sorted(boxes, key=lambda b: (b[3], b[0]))
+    boxes = sorted(boxes, key=lambda b: (b[3], b[0]))
+    if boxes:
+        shapes = ", ".join(
+            f"[{i}] {r - l}x{b - t}px" for i, (t, r, b, l) in enumerate(boxes)
+        )
+        log.info("Detected %d face(s): %s", len(boxes), shapes)
+    else:
+        log.info("Detected 0 faces")
+    return boxes
 
 
 def encode_face(
@@ -116,11 +131,16 @@ def encode_face(
     face_index is required (and validated) when more than one face is found;
     ignored-if-0 / validated when exactly one face is found.
     """
+    log.info("encode_face: image=%s face_index=%s model=%s jitters=%d",
+             image_path, face_index, model, num_jitters)
     path, image = load_image(image_path)
     boxes = detect_faces(image, model=model)
 
     if not boxes:
-        raise NoFaceFound(f"no face detected in {path.name} (model={model})")
+        raise NoFaceFound(
+            f"no face detected in {path.name} with the '{model}' detector - "
+            f"try --model cnn, or use a clearer / better-lit photo"
+        )
 
     if len(boxes) > 1 and face_index is None:
         listing = "\n".join(
@@ -139,10 +159,15 @@ def encode_face(
         )
 
     chosen = boxes[idx]
-    encoding = face_recognition.face_encodings(
-        image, known_face_locations=[chosen], num_jitters=num_jitters
-    )[0]
+    log.info("Encoding face #%d  box=%s", idx, _box_dict(chosen))
+    with step(log, f"Computing 128-d encoding (num_jitters={num_jitters})"):
+        encoding = face_recognition.face_encodings(
+            image, known_face_locations=[chosen], num_jitters=num_jitters
+        )[0]
 
+    sha = _sha256(path)
+    log.info("Encoded face #%d -> %d-d vector; source SHA-256 %s",
+             idx, int(encoding.shape[0]), sha)
     return {
         "encoding": encoding.tolist(),
         "encoding_dim": int(encoding.shape[0]),
@@ -152,7 +177,7 @@ def encode_face(
         "all_face_boxes": [_box_dict(b) for b in boxes],
         "meta": {
             "source_image": path.name,
-            "source_sha256": _sha256(path),
+            "source_sha256": sha,
             "model": model,
             "num_jitters": num_jitters,
             "encoder": ENCODER_NAME,
@@ -162,6 +187,7 @@ def encode_face(
 
 
 def _list_faces(image_path: str | Path, model: str) -> dict:
+    log.info("list-faces: image=%s model=%s", image_path, model)
     path, image = load_image(image_path)
     boxes = detect_faces(image, model=model)
     return {
@@ -215,6 +241,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    mode = "list-faces" if args.list_faces else "encode"
+    log.info("face_encoder starting  (mode=%s, image=%s)", mode, args.image)
     try:
         if args.list_faces:
             result = _list_faces(args.image, model=args.model)
@@ -226,16 +254,16 @@ def main(argv: list[str] | None = None) -> int:
                 num_jitters=args.jitters,
             )
     except FaceEncoderError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return exc.exit_code
+        return fail(log, str(exc), exc.exit_code)
 
     text = json.dumps(result, indent=2)
-    print(text)
+    print(text)  # stdout: the JSON record for later pieces
     if args.out:
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(text, encoding="utf-8")
-        print(f"\n(written to {out_path})", file=sys.stderr)
+        log.info("Wrote encoding record to %s", out_path)
+    log.info("face_encoder done  (exit 0)")
     return EXIT_OK
 
 
