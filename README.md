@@ -226,15 +226,48 @@ browser** with Playwright, uploads the photo to Bing Images' *search by image*
 (visual search), then opens the **"Pages with this image"** tab and scrapes the
 result links from it.
 
-Bing's visual search renders results in-page under tabs
-(*Overview / Visual Matches / Pages with this image / Solve*) - it no longer
-navigates to `/images/search`. The script clicks **"Pages with this image"**
-(the tab whose SERP is tagged `vsa=3`) because those are pages using the
-*exact* uploaded photo - the strong signal. It logs whether the links it
-returns came from that tab (`match type: STRONG`) or from a weaker fallback
-view (`WEAK` - visually-similar / look-alike results), and records the same in
-the JSON report (`query.match_strength`, `query.result_source`). An explicit
-"Unable to find pages with this image" card is reported as a clean zero.
+### Two candidate tiers
+
+Each candidate is labelled with a `match_type`:
+
+| `match_type` | from | `match_strength` it produces |
+|---|---|---|
+| `exact_page` | the **"Pages with this image"** tab (`vsa=3`) - pages using the *exact* uploaded photo | `high` |
+| `visual_similarity` | the **"Visual Matches"** tab (`vsa=2`), or - when Bing shows neither tab - its default post-upload page (an image→text interpretation) | `moderate` (only when there are no `exact_page` hits) |
+
+`query.match_strength` = `high` if any `exact_page`, else `moderate` if any
+`visual_similarity`, else `none`. Both tiers flow through to the pipeline's
+`extract()` - a `visual_similarity`-only result no longer stops the run.
+
+**`exact_page` is deliberately hard to earn** (a false "high" match about to be
+notarised on a public chain is the worst failure mode). `assign_tiers()` only
+labels results `exact_page` when:
+
+1. the scrape came from a section whose heading genuinely names matching images
+   (`serp:matching-section`), **and**
+2. Bing did **not** render its "Unable to find pages with this image" card, **and**
+3. the domain set does not look like SEO / content-marketing listicles
+   (`content_marketing_ratio < 0.6`).
+
+When Bing shows the "Unable to find pages with this image" card it *also* fills
+`#b_results` with ordinary web results for the text query it guessed from the
+photo. Those are **not** image matches - `_collect_result_anchors` returns
+`serp:no-exact-matches` with an empty link list, and they never become
+`exact_page`. (Earlier bug: they were scraped and labelled `exact_page` /
+`high`.) `main.py` re-checks the same content-marketing heuristic and rejects a
+suspicious `exact_page` set outright (`trace.search.exact_page_rejected`).
+
+**Bing wraps every outbound link** as `https://www.bing.com/ck/a?...&u=a1<base64>`.
+`unwrap_bing_redirect()` decodes these to the real destination *before* the
+off-site filter - without it every candidate looks like a `bing.com` link and
+gets dropped (the "0 usable links" bug).
+
+**Reverse *face* search is limited.** For most face / group photos Bing does not
+find an exact match at all - it shows "Unable to find pages with this image" and
+guesses a text topic. You then get at best `moderate` / `visual_similarity`
+candidates (pages with a *visually-similar* image, per Bing's similarity model -
+not the person). `high` / `exact_page` only happens for images that are
+genuinely indexed on the web (stock photos, logos, viral images).
 
 Every run is a live browser session - no mock, fixture, cached HTML or
 hardcoded result exists in that file. If Bing's DOM moved, a CAPTCHA appears, or
@@ -268,9 +301,11 @@ python src\face_search_fallback.py --image data\input\me.jpg --headed --keep-ope
 $LASTEXITCODE   # 0 = >=1 page, 2 = zero
 ```
 
-Output: a `match type: STRONG|WEAK` line, the ranked `#rank  source_url` list,
-then a boxed `TOP MATCH`. The same detail is in the `--out` JSON
-(`query.match_strength`, `query.result_source`, `query.bing_note`).
+Output: a `match: HIGH|MODERATE|NONE` line, a `tiers: N exact_page, M
+visual_similarity` line, the ranked `#rank [match_type] source_url` list, then a
+boxed `TOP MATCH`. The same detail is in the `--out` JSON
+(`query.match_strength`, `query.match_type`, `query.exact_page_count`,
+`query.visual_similarity_count`, `query.result_source`).
 
 Flags: `--image` / `--from-encoding` (one required), `--image-dir`, `--crop`,
 `--headed`, `--keep-open`, `--slow-mo MS`, `--timeout S`, `--debug-dir DIR`,
@@ -315,10 +350,15 @@ network touched (the Playwright import is lazy). The real check is the manual
   and solve it by hand.
 - Bing has **no official visual-search API**; the markup can change without
   notice and break the selectors - that is expected, hence the debug dumps.
-- Visual search matches the *whole image*, not identity - it is weaker than
-  Lenso's face search and returns page-level links, not ranked face confidences.
-  The "Pages with this image" tab (`match type: STRONG`) is the useful one; a
-  `WEAK` result means the script only saw visually-similar / look-alike images.
+- Bing rarely finds a true exact match for a personal photo - it shows "Unable
+  to find pages with this image" and you get `moderate` / `visual_similarity` at
+  best. `exact_page` / `high` is gated hard (see "Two candidate tiers" above)
+  precisely so a false match never gets notarised as high-confidence.
+- The `content_marketing_ratio` heuristic (`looks_like_content_marketing`) is
+  intentionally blunt - it exists to catch "we scraped a related-articles /
+  text-query panel" and will occasionally flag a legitimate blog. It only
+  *demotes* `exact_page` -> `visual_similarity` and logs a warning; it never
+  invents matches.
 - Scrapes only the public result links Bing renders; login-walled or
   JS-deferred results below the fold may be missed.
 
@@ -484,3 +524,23 @@ pytest -q tests\test_main_pipeline.py
 Orchestration flow only - the heavy pieces are faked, `chain_verify` is real
 with `upload_hash`/`verify` stubbed. Checks the wiring and every exit code; no
 dlib, browser, or network.
+
+---
+
+## Trace viewer (local, static)
+
+`frontend/viewer.html` renders any `output/trace_*.json` as a readable
+step-by-step page - face box, colour-coded candidates
+(`exact_page` / `visual_similarity`), matched post, and the on-chain result
+with a Polygonscan link. Pure client-side: the file you pick is read in the
+browser, nothing is uploaded, no server needed.
+
+```powershell
+# simplest: just open the file
+start frontend\viewer.html          # or drag it into a browser
+
+# or serve it locally if your browser blocks file://
+cd frontend && python -m http.server 8000   # -> http://localhost:8000/viewer.html
+```
+
+Then pick a `trace_*.json` from `output\`. See `frontend/README.md`.

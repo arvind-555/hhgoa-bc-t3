@@ -18,9 +18,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import chain_verify as cv  # noqa: E402
+import face_search_fallback as _real_fsf  # noqa: E402  (real helper module, not the browser)
 import main as pipeline  # noqa: E402  (main.py only imports stdlib + pipeline_log at top)
 
-_MATCH = {"source_url": "https://example.social/@dana/posts/9", "title": "sunset", "rank": 1}
+_MATCH = {"source_url": "https://example.social/@dana/posts/9", "title": "sunset",
+          "rank": 1, "match_type": "exact_page"}
+_VMATCH = {"source_url": "https://lookalike.example/p/3", "title": "similar",
+           "rank": 1, "match_type": "visual_similarity"}
 
 
 def _encoding_record(path, face_index=None, model="hog"):
@@ -43,11 +47,21 @@ def _fake_fe(encode=None):
 
 def _fake_fsf(matches, meta=None):
     err = type("FallbackError", (Exception,), {})
-    meta = meta or {"match_strength": "strong",
-                    "result_source": "the 'Pages with this image' tab",
-                    "bing_note": None}
+    ex = sum(1 for m in matches if m.get("match_type") == "exact_page")
+    vis = sum(1 for m in matches if m.get("match_type") == "visual_similarity")
+    meta = meta or {
+        "match_strength": "high" if ex else "moderate" if vis else "none",
+        "match_type": "exact_page" if ex else "visual_similarity" if vis else None,
+        "exact_page_count": ex, "visual_similarity_count": vis,
+        "result_source": "test", "bing_note": None, "visual_matches_fallback": None,
+    }
     return types.SimpleNamespace(
         FallbackError=err,
+        # main.py calls these real helpers on the module - keep them real
+        content_marketing_ratio=_real_fsf.content_marketing_ratio,
+        looks_like_content_marketing=_real_fsf.looks_like_content_marketing,
+        MATCH_TYPE_EXACT=_real_fsf.MATCH_TYPE_EXACT,
+        MATCH_TYPE_VISUAL=_real_fsf.MATCH_TYPE_VISUAL,
         bing_visual_search=lambda image_path, headed=False, timeout=45.0: (
             list(matches), None, dict(meta)),
     )
@@ -104,7 +118,8 @@ def test_unfunded_runs_1_to_3_then_stops_at_4(wire, img, tmp_path):
 
 
 def test_no_match_stops_at_step_3(wire, img, tmp_path):
-    wire(_fake_fe(), _fake_fsf([], meta={"match_strength": "weak",
+    wire(_fake_fe(), _fake_fsf([], meta={"match_strength": "none", "match_type": None,
+                                         "exact_page_count": 0, "visual_similarity_count": 0,
                                          "result_source": "default view",
                                          "bing_note": "Unable to find pages with this image"}),
          upload=lambda *a, **k: pytest.fail("upload_hash must not be called"),
@@ -119,6 +134,53 @@ def test_no_match_stops_at_step_3(wire, img, tmp_path):
     by_step = {s["step"]: s["status"] for s in t["steps"]}
     assert by_step[1] == "ok" and by_step[2] == "ok"
     assert by_step[3] == "stopped" and by_step[4] == "skipped"
+
+
+def test_pipeline_rejects_content_marketing_exact_page(wire, img, tmp_path):
+    """The bug: office-design listicles came back as exact_page/high and the
+    pipeline was about to notarize them. main.py must reject that set."""
+    farm = [
+        {"source_url": "https://www.bizbash.com/meetings/13-inspiration-sparking-design-ideas-for-meeting-rooms",
+         "rank": 1, "match_type": "exact_page"},
+        {"source_url": "https://aia-india.com/15-creative-meeting-room-ideas-that-spark-collaboration/",
+         "rank": 2, "match_type": "exact_page"},
+        {"source_url": "https://roomagine.ai/blog/conference-room-setup-ideas/",
+         "rank": 3, "match_type": "exact_page"},
+    ]
+    wire(_fake_fe(),
+         _fake_fsf(farm, meta={"match_strength": "high", "match_type": "exact_page",
+                               "exact_page_count": 3, "visual_similarity_count": 0,
+                               "result_source": "Pages with this image tab", "bing_note": None,
+                               "visual_matches_fallback": None}),
+         upload=lambda *a, **k: pytest.fail("must NOT notarize the false exact_page set"),
+         verify=lambda *a, **k: pytest.fail("must not reach verify"))
+    out = tmp_path / "trace.json"
+    rc = pipeline.run(str(img), out_path=str(out))
+
+    assert rc == pipeline.EXIT_NO_MATCH  # nothing legitimate left to notarize
+    t = json.loads(out.read_text(encoding="utf-8"))
+    assert t["search"]["exact_page_rejected"]["ratio"] >= 0.5
+    assert t["search"]["match_strength"] in ("none", "moderate")
+    assert t["matched_post"] is None
+
+
+def test_visual_similarity_only_is_accepted_not_stopped(wire, img, tmp_path):
+    """The loosened behaviour: visual_similarity-only results still flow to
+    step 4, they don't stop the pipeline like before."""
+    tx = "0x" + "77" * 32
+    wire(_fake_fe(), _fake_fsf([_VMATCH]),
+         upload=lambda post, **kw: {"tx_hash": tx, "hash": cv.hash_post(post),
+                                    "polygonscan_url": "u", "broadcast": True},
+         verify=lambda *a, **k: True)
+    out = tmp_path / "trace.json"
+    rc = pipeline.run(str(img), out_path=str(out))
+
+    assert rc == pipeline.EXIT_OK
+    t = json.loads(out.read_text(encoding="utf-8"))
+    assert t["outcome"] == "complete"
+    assert t["matched_post"]["match_type"] == "visual_similarity"
+    assert t["matched_post"]["matched_url"] == _VMATCH["source_url"]
+    assert t["search"]["match_strength"] == "moderate"
 
 
 def test_full_success_round_trip(wire, img, tmp_path):

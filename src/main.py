@@ -48,11 +48,20 @@ EXIT_STEP_FAILED = 5
 # --------------------------------------------------------------------------
 def extract_matched_post(matches: list[dict], encoding_record: dict,
                          search_meta: dict, image_path) -> dict | None:
-    """Best candidate page + whatever metadata is available. None if the search
-    produced no usable page link."""
-    best = next((m for m in matches if m.get("source_url")), None)
-    if best is None:
+    """Best candidate page + whatever metadata is available. None only if the
+    search produced no usable page link in EITHER tier (exact_page or
+    visual_similarity).
+
+    An exact_page hit is preferred; a visual_similarity hit is accepted and
+    labelled as such - step 3 no longer stops just because the only results are
+    visually-similar.
+    """
+    usable = [m for m in matches if m.get("source_url")]
+    if not usable:
         return None
+    # prefer exact_page over visual_similarity, then by rank
+    best = min(usable, key=lambda m: (m.get("match_type") != "exact_page",
+                                      m.get("rank", 99)))
     url = best["source_url"]
     meta = encoding_record.get("meta", {})
     return {
@@ -60,7 +69,10 @@ def extract_matched_post(matches: list[dict], encoding_record: dict,
         "title": best.get("title"),
         "platform": urllib.parse.urlparse(url).hostname or "",
         "rank": best.get("rank", 1),
-        "candidates_found": len(matches),
+        "match_type": best.get("match_type") or search_meta.get("match_type"),
+        "candidates_found": len(usable),
+        "exact_page_count": search_meta.get("exact_page_count"),
+        "visual_similarity_count": search_meta.get("visual_similarity_count"),
         "discovered_via": search_meta.get("result_source") or "bing-images-visual-search",
         "match_strength": search_meta.get("match_strength"),
         "query_image": meta.get("source_image") or Path(image_path).name,
@@ -162,16 +174,56 @@ def run(
     trace["search"] = {
         "candidates": matches,
         "match_strength": search_meta.get("match_strength"),
+        "match_type": search_meta.get("match_type"),
+        "exact_page_count": search_meta.get("exact_page_count"),
+        "visual_similarity_count": search_meta.get("visual_similarity_count"),
         "result_source": search_meta.get("result_source"),
         "bing_note": search_meta.get("bing_note"),
+        "visual_matches_fallback": search_meta.get("visual_matches_fallback"),
         "debug_dump": debug_dump,
     }
     note(2, "face_search_fallback", "ok",
-         candidates=len(matches), match_strength=search_meta.get("match_strength"))
-    log.info("  -> %d candidate page(s)  [%s match]", len(matches),
+         candidates=len(matches), match_strength=search_meta.get("match_strength"),
+         exact_page=search_meta.get("exact_page_count"),
+         visual_similarity=search_meta.get("visual_similarity_count"))
+    log.info("  -> %d candidate(s): %s exact_page + %s visual_similarity  ->  match_strength=%s",
+             len(matches), search_meta.get("exact_page_count"),
+             search_meta.get("visual_similarity_count"),
              search_meta.get("match_strength") or "?")
-    for m in matches[:5]:
-        log.info("       #%-2s %s", m.get("rank", "?"), m.get("source_url"))
+    for m in matches[:8]:
+        log.info("       #%-2s [%s]  %s", m.get("rank", "?"),
+                 m.get("match_type", "?"), m.get("source_url"))
+
+    # sanity check: an "exact_page" set that looks like SEO / content-marketing
+    # sites is the classic "scraped the wrong panel" false positive - do not
+    # notarize that as a high-confidence exact match.
+    exact = [m for m in matches if m.get("match_type") == "exact_page"]
+    if exact:
+        cm = fsf.content_marketing_ratio(exact)
+        if cm >= 0.5:
+            hosts = ", ".join(urllib.parse.urlparse(m["source_url"]).hostname
+                              for m in exact[:6])
+            log.error("  !! %.0f%% of the exact_page candidates are generic "
+                      "content-marketing / listicle sites (%s)", cm * 100, hosts)
+            log.error("  !! this is the known DOM-misread false-positive pattern - "
+                      "NOT notarizing these as an exact match")
+            note(2, "face_search_fallback", "suspect_exact_page",
+                 content_marketing_ratio=round(cm, 2), hosts=hosts)
+            trace["search"]["exact_page_rejected"] = {
+                "reason": "content_marketing_ratio>=0.5", "ratio": round(cm, 2),
+                "hosts": hosts, "urls": [m["source_url"] for m in exact],
+            }
+            # drop the suspect exact_page tier; keep only genuine visual_similarity
+            matches = [m for m in matches if m.get("match_type") != "exact_page"]
+            for r, m in enumerate(matches, 1):
+                m["rank"] = r
+            search_meta = {**search_meta, "match_type": "visual_similarity" if matches else None,
+                           "exact_page_count": 0,
+                           "match_strength": "moderate" if matches else "none",
+                           "result_source": "exact_page tier rejected as content-marketing; "
+                           + str(search_meta.get("result_source") or "")}
+            trace["search"]["match_strength"] = search_meta["match_strength"]
+            trace["search"]["candidates"] = matches
 
     # ---------- 3. extract the matched post ----------
     log.info("[STEP 3/5] extract - pick the best matched post")
@@ -179,19 +231,25 @@ def run(
     if matched_post is None:
         trace["matched_post"] = None
         trace["outcome"] = "no-match"
-        note(3, "extract", "stopped", reason="no usable page link in the search results")
+        note(3, "extract", "stopped", reason="no usable link in either tier "
+             "(exact_page / visual_similarity)")
         note(4, "chain_verify.upload_hash", "skipped", reason="nothing to notarize")
         note(5, "chain_verify.verify", "skipped", reason="nothing to notarize")
         _write_trace(trace, out_path)
-        log.warning("  -> no matched post: the search returned no usable page links")
+        log.warning("  -> no matched post: 0 candidates in exact_page AND visual_similarity")
         if search_meta.get("bing_note"):
             log.warning("     Bing said: %s", search_meta["bing_note"])
         if not headed:
             log.warning("     Bing degrades headless results - retry with:  "
                         "python src/main.py %s --headed", image_path)
-        return fail(log, "stopped at step 3: nothing to notarize (no match found)", EXIT_NO_MATCH)
+        return fail(log, "stopped at step 3: nothing to notarize (no match in either tier)",
+                    EXIT_NO_MATCH)
     trace["matched_post"] = matched_post
-    note(3, "extract", "ok", matched_url=matched_post["matched_url"])
+    note(3, "extract", "ok", matched_url=matched_post["matched_url"],
+         match_type=matched_post.get("match_type"))
+    if matched_post.get("match_type") != "exact_page":
+        log.warning("  -> best candidate is %s (not an exact-image page)",
+                    matched_post.get("match_type"))
     log.info("  -> matched post:")
     for k, v in matched_post.items():
         log.info("       %-18s %s", k, v)

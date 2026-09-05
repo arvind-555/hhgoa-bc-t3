@@ -6,11 +6,21 @@ fallback: it drives a REAL Chromium browser with Playwright, uploads the photo
 to Bing Images' "search by image" (visual search), opens the "Pages with this
 image" tab, and scrapes the URLs of the web pages that use it.
 
-Bing's visual search now renders results in-page under tabs ("Overview /
-Visual Matches / Pages with this image / Solve") - it no longer navigates to
-/images/search. We wait for that UI, click "Pages with this image" (pages
-using the *exact* photo - a strong signal) rather than settling for "Visual
-Matches" (visually-similar look-alikes - weak), and log which one we returned.
+Two tiers of candidate, each labelled honestly:
+  * match_type "exact_page"        - from the "Pages with this image" tab
+  * match_type "visual_similarity" - from the "Visual Matches" tab, or (when
+                                     Bing shows neither tab) its default
+                                     post-upload results
+
+meta["match_strength"] reflects whichever tier found results:
+  "high"     - >= 1 exact_page candidate
+  "moderate" - 0 exact_page, >= 1 visual_similarity candidate
+  "none"     - both tiers empty
+
+All of Bing's outbound links are `https://www.bing.com/ck/a?...&u=a1<base64>`
+redirect wrappers; `unwrap_bing_redirect()` resolves them to the real
+destination before filtering, otherwise every candidate looks like a bing.com
+link and gets dropped.
 
 There is NO mock, fixture, sample, cached HTML or hardcoded result anywhere in
 this file. Every run launches a browser and performs a live search; if Bing's
@@ -39,6 +49,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import hashlib
 import json
@@ -77,6 +89,11 @@ _PAGES_TAB_RE = re.compile(
 # Bing tags the "Pages with this image" results SERP with vsa=3 in the URL
 # (vsa=2 is "Visual Matches"). Used to confirm the tab click actually landed.
 _PAGES_TAB_URL_RE = re.compile(r"[?&]vsa=3(?:&|$)")
+
+# "Visual Matches" tab - the fallback when "Pages with this image" has nothing.
+# It lists visually-similar images (look-alikes), so it is always a WEAK match.
+_VISUAL_MATCHES_RE = re.compile(r"visual\s+matches", re.I)
+_VISUAL_MATCHES_URL_RE = re.compile(r"[?&]vsa=2(?:&|$)")
 
 # On the vsa=3 SERP the matching pages render as normal Bing web results; the
 # "no pages" state renders an #error-title card. Wait for either.
@@ -244,16 +261,41 @@ def is_offsite(url: str) -> bool:
     return not any(host == h or host.endswith("." + h) for h in _OWN_HOSTS)
 
 
+def unwrap_bing_redirect(url: str) -> str:
+    """Bing wraps every outbound result link as
+    `https://www.bing.com/ck/a?...&u=a1<base64url>` - which our off-site filter
+    would otherwise throw away as "a bing.com link". Return the real destination
+    (or the url unchanged if it isn't a wrapper).
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return url
+    if "bing.com" not in (parsed.hostname or "") or not parsed.path.startswith("/ck/"):
+        return url
+    u = urllib.parse.parse_qs(parsed.query).get("u", [""])[0]
+    if not u:
+        return url
+    if u[:2] in ("a1", "a2", "a3"):  # Bing's format marker
+        u = u[2:]
+    u += "=" * (-len(u) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(u).decode("utf-8", "replace")
+    except (binascii.Error, ValueError):
+        return url
+    return decoded if decoded.startswith(("http://", "https://")) else url
+
+
 def extract_page_urls(anchors: list[dict]) -> list[dict]:
     """anchors: [{'href': ..., 'text': ...}] scraped from the results DOM.
 
-    Keep off-site http(s) links, drop Bing's own image-search URLs, dedupe on
-    host+path (order preserved), and rank.
+    Unwrap Bing's `/ck/a` redirect links, keep the off-site http(s) ones, drop
+    Bing's own image-search URLs, dedupe on host+path (order preserved), rank.
     """
     out: list[dict] = []
     seen: set[str] = set()
     for a in anchors:
-        href = (a.get("href") or "").strip()
+        href = unwrap_bing_redirect((a.get("href") or "").strip())
         if not href.lower().startswith(("http://", "https://")):
             continue
         if not is_offsite(href):
@@ -265,7 +307,10 @@ def extract_page_urls(anchors: list[dict]) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
-        title = " ".join((a.get("text") or "").split())[:200]
+        title = " ".join((a.get("text") or "").split())
+        # Bing's `a.tilk` anchors read "Site Name https://site.com > a > b" -
+        # keep just the readable name.
+        title = re.split(r"\s+https?://", title, maxsplit=1)[0][:200]
         out.append({"source_url": href, "title": title or None})
 
     for rank, m in enumerate(out, start=1):
@@ -381,86 +426,85 @@ def _find_file_input(page):
 
 
 def _collect_result_anchors(page) -> dict:
-    """Scrape candidate result links from the "Pages with this image" view.
+    """Scrape the "Pages with this image" (vsa=3) SERP - carefully.
 
-    That view is a normal Bing SERP: results are `#b_results > li.b_algo`, and an
-    explicit "Unable to find pages with this image" card means a definitive zero.
-    Falls back to heading-named sections / known containers / the whole document
-    if the SERP markup isn't found. Returns {'mode', 'links', 'error'}.
+    When Bing has NO exact-image match it (a) renders an
+    "Unable to find pages with this image" card AND (b) fills #b_results with
+    ordinary web results for the text query it derived from the photo. Those
+    web results are NOT image matches - scraping them and calling them
+    "exact_page" is a false positive. So:
+
+      mode 'serp:no-exact-matches'  - the "unable to find" card is present.
+                                      links = []  (the #b_results list is a
+                                      text-query fallback, deliberately ignored).
+      mode 'serp:matching-section'  - a section whose heading actually names
+                                      matching / including pages. links = that
+                                      section's anchors  (a real exact_page set).
+      mode 'serp:vsa3-weblist'      - on a vsa=3 URL, #b_results has b_algo rows,
+                                      but no "unable to find" card and no
+                                      labelled matching section. AMBIGUOUS - the
+                                      caller must NOT treat these as exact_page
+                                      without corroboration.
+      mode 'serp:generic'/'document'- b_algo / anchors, not on a vsa=3 URL.
+
+    Returns {'mode', 'links', 'error'}.
     """
     js = r"""() => {
-      const grab = root => [...root.querySelectorAll("a[href]")].map(a => ({
-        href: a.href,
-        text: (a.innerText || a.getAttribute('aria-label') || a.title || '').trim(),
-      }));
-      const httpOnly = xs => xs.filter(x => x.href.startsWith('http'));
+      const T = s => (s || '').replace(/\s+/g, ' ').trim();
+      const grab = root => [...root.querySelectorAll('a[href]')]
+        .map(a => ({href: a.href, text: T(a.getAttribute('aria-label') || a.innerText || a.title)}))
+        .filter(x => x.href.startsWith('http'));
 
-      // explicit "no pages" card that Bing renders on the vsa=3 SERP
-      const errEl = document.querySelector(
-        '#error-title, .search-error-container .error-title');
-      const error = errEl ? (errEl.innerText || '').trim() : '';
+      // (1) the "no exact matches" card WINS. Everything in #b_results under it
+      //     is Bing's derived-text-query web list, not image matches.
+      const errEl = document.querySelector('#error-title, .search-error-container .error-title');
+      const errText = errEl ? T(errEl.innerText) : '';
+      const noMatch = /unable to find pages with this image|no matching pages|couldn.?t find pages/i;
+      if (noMatch.test(errText) || noMatch.test(document.body.innerText.slice(0, 20000))) {
+        return {mode: 'serp:no-exact-matches', links: [],
+                error: errText || 'Unable to find pages with this image'};
+      }
 
-      // 1. the "Pages with this image" SERP: matching pages are normal Bing
-      //    web results (li.b_algo), one link per result.
-      const algo = [...document.querySelectorAll(
-        '#b_results li.b_algo, #b_results .b_algo, ol#b_results > li, .b_algo')];
+      // (2) a section whose heading genuinely names matching / including pages
+      const heads = [...document.querySelectorAll('h1,h2,h3,h4,[role=heading],.b_focusLabel,.iuscp_hd')];
+      for (const h of heads) {
+        const t = T(h.innerText).toLowerCase();
+        const names_matches = t.includes('page') &&
+          (t.includes('matching image') || t.includes('include this image') ||
+           t.includes('that include') || t.includes('with this image'));
+        if (!names_matches) continue;
+        let sec = h.closest('section,ol,ul,div');
+        for (let i = 0; i < 3 && sec; i++) {
+          const links = grab(sec);
+          if (links.length) return {mode: 'serp:matching-section', links, error: ''};
+          sec = sec.parentElement;
+        }
+      }
+
+      // (3) the #b_results web list
+      const onVsa3 = /[?&]vsa=3(&|$)/.test(location.href);
+      const algo = [...document.querySelectorAll('#b_results li.b_algo, #b_results .b_algo')];
       if (algo.length) {
         const links = [];
         for (const li of algo) {
-          const a = li.querySelector('h2 a[href], a.tilk[href], .b_algoheader a[href]')
-                    || li.querySelector('a[href]');
-          if (a && a.href.startsWith('http')) {
-            links.push({href: a.href, text: (a.innerText || '').trim()});
-          }
+          const a = li.querySelector('h2 a[href^="http"], a.tilk[href^="http"], '
+                                     + '.b_algoheader a[href^="http"]')
+                    || li.querySelector('a[href^="http"]');
+          if (a) links.push({href: a.href, text: T(a.getAttribute('aria-label') || a.innerText)});
         }
-        if (links.length) return {mode: 'serp:b_algo', links, error};
-      }
-      if (error) return {mode: 'serp:error-card', links: [], error};
-
-      // 1b. same SERP, less specific: any off-site link in the results column
-      for (const sel of ['#b_results', '#b_content', 'main']) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const links = httpOnly(grab(el));
-          if (links.length) return {mode: 'serp:' + sel, links, error};
-        }
+        if (links.length)
+          return {mode: onVsa3 ? 'serp:vsa3-weblist' : 'serp:generic', links, error: ''};
       }
 
-      // 2. a section whose heading names matching / including / "this image" pages
-      const heads = [...document.querySelectorAll(
-        "h1,h2,h3,h4,[role=heading],.tab-head,.iuscp_hd,.vsi_head")];
-      for (const h of heads) {
-        const t = (h.innerText || '').toLowerCase();
-        if (t.includes('page') &&
-            (t.includes('match') || t.includes('includ') || t.includes('this'))) {
-          let sec = h.closest('section,div');
-          for (let i = 0; i < 4 && sec; i++) {
-            const links = httpOnly(grab(sec));
-            if (links.length > 2) return {mode: 'section:' + t.slice(0, 40), links, error};
-            sec = sec.parentElement;
-          }
-        }
-      }
-
-      // 3. known result containers
-      for (const sel of ['.pageResults', '.insights', '#insights', '.richImgArea',
-                         '[class*=insights]', '#vsi_results']) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const links = httpOnly(grab(el));
-          if (links.length) return {mode: sel, links, error};
-        }
-      }
-
-      // 4. whole document (weak - lots of Bing chrome will be filtered out later)
-      return {mode: 'document', links: httpOnly(grab(document)), error};
+      // (4) nothing structured
+      return {mode: 'document', links: grab(document), error: ''};
     }"""
     data = page.evaluate(js)
     if not isinstance(data, dict):
         log.warning("Result scrape returned no data; treating as empty")
         return {"mode": "document", "links": [], "error": ""}
     data.setdefault("error", "")
-    log.info("Scraped %d raw link(s) from the results page (locator: %s)%s",
+    log.info("Scraped %d raw link(s) (mode=%s)%s",
              len(data.get("links", [])), data.get("mode"),
              f'; Bing card: "{data["error"]}"' if data.get("error") else "")
     return data
@@ -475,44 +519,40 @@ def _settle(page, ms: int = 6000) -> None:
         pass
 
 
-def _select_pages_tab(page, timeout_ms: int) -> tuple[str | None, bool]:
-    """Wait for and click Bing's "Pages with this image" tab.
+def _open_result_tab(page, name_re, url_re, timeout_ms: int, what: str) -> tuple[str | None, bool]:
+    """Find + click one of Bing's visual-search result tabs and wait for its
+    SERP URL (`?...&vsa=N`).
 
-    That tab lists pages using the *exact* uploaded photo - the strong signal we
-    want (an actual post), not "Visual Matches" / look-alike strangers.
-
-    The tab is an <a> that navigates to a `?...&vsa=3` SERP; we click it and
-    wait for that URL (or, failing that, network idle) before returning.
-
-    Returns (tab_label, is_strong):
-      * (label, True)  - clicked the tab and landed on the vsa=3 results SERP
-      * (label, False) - the tab was found but the click did not land there;
-                         the caller scrapes whatever is shown (weak)
-      * (None,  False) - no such tab at all (Bing changed its markup)
+    Returns (tab_label, landed):
+      * (label, True)  - clicked and landed on that tab's SERP
+      * (label, False) - tab found but the click didn't reach its SERP
+      * (None,  False) - no such tab (Bing changed its markup)
     """
     tab = (
-        page.get_by_role("tab", name=_PAGES_TAB_RE)
-        .or_(page.get_by_role("link", name=_PAGES_TAB_RE))
-        .or_(page.get_by_role("button", name=_PAGES_TAB_RE))
-        .or_(page.get_by_text(_PAGES_TAB_RE))
+        page.get_by_role("tab", name=name_re)
+        .or_(page.get_by_role("link", name=name_re))
+        .or_(page.get_by_role("button", name=name_re))
+        .or_(page.get_by_text(name_re))
         .first
     )
+    # The tab bar, when Bing shows it, renders within a few seconds - don't burn
+    # the whole per-step budget waiting for a tab that isn't there.
     try:
-        tab.wait_for(state="visible", timeout=timeout_ms)
+        tab.wait_for(state="visible", timeout=min(timeout_ms, 12000))
     except Exception:
-        log.warning("No 'Pages with this image' tab appeared (regex %s)",
-                    _PAGES_TAB_RE.pattern)
+        log.warning("No %r tab appeared (regex %s) - Bing didn't render its "
+                    "visual-search tab bar for this image", what, name_re.pattern)
         return None, False
 
     try:
         label = " ".join((tab.inner_text(timeout=2000) or "").split())
     except Exception:
         label = ""
-    label = label or "Pages with this image"
+    label = label or what
     log.info("Found the %r tab", label)
 
-    if _PAGES_TAB_URL_RE.search(page.url or ""):
-        log.info("Already on the vsa=3 results SERP")
+    if url_re.search(page.url or ""):
+        log.info("Already on the %s SERP", what)
         return label, True
 
     clicked = False
@@ -529,19 +569,91 @@ def _select_pages_tab(page, timeout_ms: int) -> tuple[str | None, bool]:
 
     landed = False
     try:
-        page.wait_for_url(_PAGES_TAB_URL_RE, timeout=timeout_ms)
+        page.wait_for_url(url_re, timeout=timeout_ms)
         landed = True
     except Exception:
-        landed = bool(_PAGES_TAB_URL_RE.search(page.url or ""))
+        landed = bool(url_re.search(page.url or ""))
     try:
         page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
     except Exception:
         pass
     _settle(page)
     log.info("Clicked %r; %s (url=%s)", label,
-             "landed on the vsa=3 results SERP" if landed
-             else "did NOT reach the vsa=3 SERP", page.url)
+             f"landed on the {what} SERP" if landed else f"did NOT reach the {what} SERP",
+             page.url)
     return label, landed
+
+
+def _select_pages_tab(page, timeout_ms: int) -> tuple[str | None, bool]:
+    """Open the "Pages with this image" tab (pages using the *exact* photo -
+    the strong signal), not "Visual Matches" / look-alike strangers."""
+    return _open_result_tab(page, _PAGES_TAB_RE, _PAGES_TAB_URL_RE, timeout_ms,
+                            "Pages with this image")
+
+
+def _collect_visual_matches(page) -> dict:
+    """Scrape source-page links off Bing's visually-similar results.
+
+    Covers three DOM shapes Bing has shipped for this:
+      * old image grid  - `a.iusc[m]` whose `m` JSON `purl` is the source page
+      * newer "similar images" panel - `.richImgLnk` / `.iuscp a`
+      * the plain SERP Bing now returns for many photos - each web result's
+        source-site link (`a.tilk`) and title link (`#b_results li.b_algo h2 a`)
+
+    Every href is passed through `unwrap_bing_redirect` later, so the
+    `https://www.bing.com/ck/a?...` wrappers Bing puts on all outbound links are
+    resolved to the real destination. Returns {'mode', 'links'}.
+    """
+    js = r"""() => {
+      const seen = new Set();
+      const push = (arr, href, text) => {
+        if (href && !seen.has(href)) { seen.add(href); arr.push({href, text: (text||'').trim()}); }
+      };
+
+      // 1. image cards with a JSON `m` blob (purl = the page the image is on)
+      const cards = [];
+      for (const el of document.querySelectorAll('[m]')) {
+        const raw = el.getAttribute('m');
+        if (!raw || raw.indexOf('purl') === -1) continue;
+        try {
+          const j = JSON.parse(raw);
+          if (j && j.purl && /^https?:/i.test(j.purl)) push(cards, j.purl, j.t || j.desc);
+        } catch (e) {}
+      }
+      if (cards.length) return {mode: 'vm:image-cards', links: cards};
+
+      // 2. "similar images" / insights panel anchors
+      const sim = [];
+      for (const a of document.querySelectorAll(
+          '.richImgLnk[href], .iuscp a[href], .insights a[href^="http"], '
+          + '.similarView a[href], .imgpt a[href]')) {
+        push(sim, a.href, a.innerText || a.getAttribute('aria-label') || a.title);
+      }
+      if (sim.length) return {mode: 'vm:similar-panel', links: sim};
+
+      // 3. the plain SERP Bing returns for many photos: per-result source link
+      //    (a.tilk) + the result title link
+      const serp = [];
+      for (const a of document.querySelectorAll(
+          '#b_results li.b_algo a.tilk[href], #b_results li.b_algo h2 a[href], '
+          + '#b_results .b_algo cite ~ a[href], #b_results a.tilk[href]')) {
+        push(serp, a.href, a.getAttribute('aria-label') || a.innerText || a.title);
+      }
+      if (serp.length) return {mode: 'vm:serp-results', links: serp};
+
+      // 4. last resort: every http anchor in the main content column
+      const main = document.querySelector('#b_content, main, body');
+      const any = [];
+      if (main) for (const a of main.querySelectorAll('a[href^="http"]'))
+        push(any, a.href, a.innerText || a.title);
+      return {mode: any.length ? 'vm:any-anchor' : 'vm:empty', links: any};
+    }"""
+    data = page.evaluate(js)
+    if not isinstance(data, dict):
+        return {"mode": "vm:empty", "links": []}
+    log.info("Visual Matches scrape: %d raw link(s) (locator: %s)",
+             len(data.get("links", [])), data.get("mode"))
+    return data
 
 
 def _wait_for_serp_results(page, timeout_ms: int) -> None:
@@ -572,6 +684,115 @@ def _wait_for_serp_results(page, timeout_ms: int) -> None:
     log.warning("Results SERP did not clearly render after 4 tries - scraping anyway")
 
 
+MATCH_TYPE_EXACT = "exact_page"          # pages that use the EXACT uploaded image
+MATCH_TYPE_VISUAL = "visual_similarity"  # visually-similar / Bing-derived results
+
+
+def score_matches(exact_matches: list[dict], visual_matches: list[dict]) -> tuple[str, str]:
+    """Combine the two tiers into (match_strength, result_source).
+
+    match_strength:
+      * "high"     - >= 1 exact_page match ("Pages with this image")
+      * "moderate" - 0 exact_page, >= 1 visual_similarity match ("Visual
+                     Matches", or Bing's derived-SERP results)
+      * "none"     - both tiers empty
+
+    Never contradicts the candidate lists: "high"/"moderate" only when that
+    tier actually has links.
+    """
+    if exact_matches:
+        return "high", (f"{len(exact_matches)} page(s) using this exact image "
+                        "('Pages with this image')")
+    if visual_matches:
+        return "moderate", (f"{len(visual_matches)} visually-similar result(s) "
+                            "('Visual Matches' / Bing's image interpretation) - "
+                            "no exact-image pages found")
+    return "none", "no results in either tier ('Pages with this image' or 'Visual Matches')"
+
+
+def tag_matches(matches: list[dict], match_type: str) -> list[dict]:
+    """Stamp each candidate with its match_type and re-rank 1..N (in place)."""
+    for rank, m in enumerate(matches, start=1):
+        m["match_type"] = match_type
+        m["rank"] = rank
+    return matches
+
+
+# Domains / URL shapes that are SEO listicles / content-marketing, i.e. very
+# unlikely to host a specific personal photo. If an "exact_page" set is mostly
+# these, we almost certainly scraped a related-articles / text-query panel.
+_LISTICLE_PATH_RE = re.compile(
+    r"/\d{1,3}[-_][a-z][a-z-]*\b(best|top|creative|smart|inspiring|powerful|amazing|"
+    r"stunning|essential|genius|clever|inspiration|ideas?|ways|tips|design|setup|"
+    r"trends?|guide|hacks?|examples?)\b", re.I,
+)
+_CONTENT_MARKETING_HINTS = ("/blog/", "/blogs/", "/ideas/", "/inspiration/", "/guide",
+                            "/tips", "-ideas", "-guide", "/how-to", "/trends", "-setup-",
+                            "-design-", "-inspiration")
+
+
+def looks_like_content_marketing(url: str) -> bool:
+    """Heuristic: does this URL look like an SEO listicle / content-marketing
+    article (e.g. "13-design-ideas-for-meeting-rooms") rather than a page that
+    would actually host a specific user's photo? Used to catch the "we scraped
+    a related-articles / text-query panel and called it exact_page" bug."""
+    try:
+        p = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    host, path = (p.hostname or "").lower(), (p.path or "").lower()
+    if host in ("pinterest.com", "www.pinterest.com") and "/ideas/" in path:
+        return True
+    if _LISTICLE_PATH_RE.search(path):
+        return True
+    return sum(1 for h in _CONTENT_MARKETING_HINTS if h in path) >= 2
+
+
+def content_marketing_ratio(matches: list[dict]) -> float:
+    if not matches:
+        return 0.0
+    n = sum(1 for m in matches if looks_like_content_marketing(m.get("source_url", "")))
+    return n / len(matches)
+
+
+def assign_tiers(scrape_mode: str, raw_matches: list[dict], *,
+                 bing_zero_msg: str) -> tuple[list[dict], list[dict], list[str]]:
+    """Pure: from the scrape, decide (exact_matches, visual_candidates, notes).
+
+    This is the guard against "scraped the wrong DOM panel and called it
+    exact_page". Every branch is deliberately conservative:
+
+      * Bing said "unable to find pages with this image"  -> exact = [] (hard
+        zero; the accompanying #b_results is a text-query fallback, dropped).
+      * a genuinely labelled matching-images section       -> exact = raw.
+      * a vsa=3 #b_results web list with no such label      -> NOT exact; the
+        links become visual_similarity candidates instead.
+      * anything else                                       -> visual_similarity.
+      * an "exact" set that is mostly SEO listicles         -> demoted to
+        visual_similarity (known false-positive pattern).
+    """
+    notes: list[str] = []
+    if bing_zero_msg or scrape_mode == "serp:no-exact-matches":
+        return [], [], ["bing_reports_no_exact_matches"]
+
+    if scrape_mode == "serp:matching-section" and raw_matches:
+        exact = list(raw_matches)
+        ratio = content_marketing_ratio(exact)
+        if ratio >= 0.6 and len(exact) >= 3:
+            notes.append(f"exact_page demoted: {ratio:.0%} look like content-marketing "
+                         "sites (misidentified DOM panel pattern)")
+            return [], exact, notes
+        return exact, [], notes
+
+    if scrape_mode == "serp:vsa3-weblist":
+        notes.append("on vsa=3 but results are a derived-text-query web list "
+                     "(no matching-images section) - NOT labelled exact_page")
+        return [], list(raw_matches), notes
+
+    notes.append(f"results from Bing's default page (mode={scrape_mode})")
+    return [], list(raw_matches), notes
+
+
 def bing_visual_search(
     image_path: Path,
     *,
@@ -584,12 +805,17 @@ def bing_visual_search(
     """Run a live Bing Images visual search for image_path.
 
     Returns (matches, debug_dump, meta):
-      * debug_dump is set only when the results page loaded but yielded zero
-        off-site links (so you can check it was really empty, not a scrape miss).
-      * meta = {"result_source": <human string>, "match_strength": "strong"|"weak"}
-        - "strong" means the links came from the "Pages with this image" tab
-        (pages using the exact photo); "weak" means we fell back to whatever
-        Bing showed (visually-similar / look-alike results).
+      * matches - each dict has `source_url`, `title`, `rank`, and
+        `match_type` = "exact_page" | "visual_similarity".
+      * debug_dump - set only when we got nothing and Bing gave no explicit card.
+      * meta = {
+          "match_strength": "high"|"moderate"|"none",  # high = >=1 exact_page,
+                                                       # moderate = visual only
+          "match_type": "exact_page"|"visual_similarity"|None,  # of the returned tier
+          "exact_page_count": int, "visual_similarity_count": int,
+          "result_source": <human string>, "bing_note": <str|None>,
+          "visual_matches_fallback": {attempted,tab_found,landed,usable_links}|None,
+        }
     """
     try:
         from playwright.sync_api import Error as PWError
@@ -697,41 +923,123 @@ def bing_visual_search(
                     debug_dump=_dump_debug(page, debug_dir),
                 )
 
-            with step(log, "Scraping result links"):
-                scraped = _collect_result_anchors(page)
-                matches = extract_page_urls(scraped.get("links", []))
-                log.info("Kept %d off-site page link(s) after filtering Bing/dupes "
-                         "(from %d raw)", len(matches), len(scraped.get("links", [])))
-            bing_zero_msg = (scraped.get("error") or "").strip()
-            on_pages_serp = str(scraped.get("mode", "")).startswith("serp:")
+            pages_tab_present = tab_label is not None
+            on_vsa3 = bool(_PAGES_TAB_URL_RE.search(page.url or ""))
 
-            # real breakage: no tab, no results, and no explicit "zero" card
-            if tab_label is None and not matches and not bing_zero_msg:
+            # ---- Tier 1: exact_page ("Pages with this image") ----------------
+            with step(log, "Scraping the 'Pages with this image' SERP"):
+                scraped = _collect_result_anchors(page)
+                raw = extract_page_urls(scraped.get("links", []))
+                log.info("Kept %d off-site link(s) (from %d raw, scrape mode %s, on_vsa3=%s)",
+                         len(raw), len(scraped.get("links", [])), scraped.get("mode"), on_vsa3)
+            scrape_mode = str(scraped.get("mode", ""))
+            bing_zero_msg = (scraped.get("error") or "").strip()
+
+            exact_matches, derived_serp_matches, tier_notes = assign_tiers(
+                scrape_mode, raw, bing_zero_msg=bing_zero_msg)
+            for n in tier_notes:
+                log.warning("tier check: %s", n)
+            if exact_matches:
+                exact_matches = tag_matches(exact_matches, MATCH_TYPE_EXACT)
+                log.info("%d exact_page candidate(s) from a labelled matching-images section",
+                         len(exact_matches))
+            elif bing_zero_msg:
+                log.info("Bing: %r  ->  0 exact_page matches (the #b_results web list here "
+                         "is a text-query fallback, not image matches)", bing_zero_msg)
+            elif derived_serp_matches:
+                log.warning("%d link(s) are NOT confirmed exact-image pages - routing to the "
+                            "visual_similarity tier instead", len(derived_serp_matches))
+
+            # ---- Tier 2: visual_similarity ("Visual Matches" tab) -----------
+            visual_matches: list[dict] = []
+            vm_fallback: dict | None = None
+            if not exact_matches:
+                log.info("No exact-image pages - trying the 'Visual Matches' tab...")
+                vm_fallback = {"attempted": True, "tab_found": False,
+                               "landed": False, "usable_links": 0}
+                fb_timeout_ms = min(timeout_ms, 15000)  # don't double the wall time
+                with step(log, "Opening the 'Visual Matches' tab"):
+                    vm_label, vm_landed = _open_result_tab(
+                        page, _VISUAL_MATCHES_RE, _VISUAL_MATCHES_URL_RE, fb_timeout_ms,
+                        "Visual Matches")
+                    if vm_label is not None:
+                        _wait_for_serp_results(page, fb_timeout_ms)
+                        _settle(page)
+                if vm_label is None:
+                    log.warning("No 'Visual Matches' tab on this page (Bing's markup, "
+                                "or a headless shell, or a face photo Bing won't reverse-search)")
+                else:
+                    vm_fallback["tab_found"] = True
+                    vm_fallback["landed"] = vm_landed
+                    vm_scraped = _collect_visual_matches(page)
+                    vm_matches = extract_page_urls(vm_scraped.get("links", []))
+                    vm_fallback["usable_links"] = len(vm_matches)
+                    if vm_matches:
+                        log.info("'Visual Matches' tab supplied %d candidate(s)", len(vm_matches))
+                        visual_matches = vm_matches
+                    else:
+                        log.warning("'Visual Matches' tab returned 0 usable links for this image")
+
+            # If neither tab produced anything but Bing's default page had links,
+            # use those as the visual tier (honestly labelled).
+            if not exact_matches and not visual_matches and derived_serp_matches:
+                log.warning("Falling back to Bing's default-page results as "
+                            "visual_similarity candidates (%d link(s))", len(derived_serp_matches))
+                visual_matches = derived_serp_matches
+            if visual_matches:
+                visual_matches = tag_matches(visual_matches, MATCH_TYPE_VISUAL)
+
+            # ---- real breakage: nothing anywhere, no tab, no "no pages" card -
+            vm_tab_found = bool(vm_fallback and vm_fallback["tab_found"])
+            if (not pages_tab_present and not vm_tab_found
+                    and not exact_matches and not visual_matches and not bing_zero_msg):
                 raise ScrapeError(
-                    "uploaded the image but found neither the 'Pages with this image' tab "
-                    "nor any results. Bing's visual-search UI has likely changed - re-run "
-                    "with --headed and update _select_pages_tab() / _collect_result_anchors().",
+                    "uploaded the image but found no results tabs ('Pages with this image' / "
+                    "'Visual Matches') and no result links anywhere. Bing's visual-search UI "
+                    "has likely changed - re-run with --headed and update _open_result_tab() / "
+                    "_collect_result_anchors() / _collect_visual_matches().",
                     debug_dump=_dump_debug(page, debug_dir),
                 )
 
-            if tab_label is not None and (is_strong or on_pages_serp):
-                is_strong = True
-                result_source = f"the {tab_label!r} tab"
-            elif tab_label is not None:
-                result_source = (f"default view ({tab_label!r} tab found but the click "
-                                 "did not land on the results SERP)")
-            else:
-                result_source = "default view (no 'Pages with this image' tab found)"
-                is_strong = False
+            matches = exact_matches or visual_matches
+            match_strength, result_source = score_matches(exact_matches, visual_matches)
 
-            match_strength = "strong" if is_strong else "weak"
-            if is_strong:
-                log.info("Returning %d page(s) from %s  ->  STRONG match "
-                         "(pages that use this exact image)", len(matches), result_source)
-            else:
-                log.warning("Returning %d page(s) from %s  ->  WEAK match "
-                            "(visually-similar / look-alike results, not this exact photo)",
+            # ---- DEBUG: exactly what we're about to return, and from where ----
+            log.info("Candidates: %d exact_page, %d visual_similarity  "
+                     "(scrape_mode=%s, on_vsa3=%s, pages_tab=%r, vm_tab=%s, bing_card=%r)  "
+                     "->  match_strength=%s",
+                     len(exact_matches), len(visual_matches), scrape_mode, on_vsa3,
+                     tab_label, (vm_fallback or "not attempted"),
+                     bing_zero_msg or None, match_strength)
+            for i, m in enumerate(matches, 1):
+                log.info("    candidate[%d] (%s)  %s", i, m.get("match_type"),
+                         m.get("source_url"))
+            if not matches:
+                log.info("    (no candidates in either tier)")
+
+            # extra guard: an exact_page set dominated by content-marketing
+            # domains is the classic "scraped the wrong panel" tell - warn loudly
+            # even though assign_tiers should already have demoted it.
+            if exact_matches:
+                cm = content_marketing_ratio(exact_matches)
+                if cm >= 0.5:
+                    log.warning("!! %.0f%% of the exact_page candidates look like generic "
+                                "content-marketing / listicle sites - treat this "
+                                "match_strength=high with suspicion (possible DOM misread): %s",
+                                cm * 100, ", ".join(
+                                    urllib.parse.urlparse(m["source_url"]).hostname
+                                    for m in exact_matches[:6]))
+
+            if match_strength == "high":
+                log.info("Returning %d exact_page candidate(s) from %s  ->  match_strength=high",
+                         len(matches), result_source)
+            elif match_strength == "moderate":
+                log.warning("Returning %d visual_similarity candidate(s) from %s  ->  "
+                            "match_strength=moderate (no confirmed exact-image pages)",
                             len(matches), result_source)
+            else:
+                log.warning("No candidates in either tier  ->  match_strength=none (%s)",
+                            result_source)
             if bing_zero_msg:
                 log.info("Bing card on the page: %r", bing_zero_msg)
 
@@ -742,14 +1050,17 @@ def bing_visual_search(
                 except EOFError:
                     page.wait_for_timeout(15000)
 
-            # dump the page only when we got nothing AND Bing didn't explicitly
-            # say "no pages" (i.e. it might be a scrape miss worth inspecting)
             debug_dump = (_dump_debug(page, debug_dir)
                           if (not matches and not bing_zero_msg) else None)
             meta = {
                 "result_source": result_source,
                 "match_strength": match_strength,
+                "match_type": (MATCH_TYPE_EXACT if exact_matches
+                               else MATCH_TYPE_VISUAL if visual_matches else None),
+                "exact_page_count": len(exact_matches),
+                "visual_similarity_count": len(visual_matches),
                 "bing_note": bing_zero_msg or None,
+                "visual_matches_fallback": vm_fallback,
             }
             return matches, debug_dump, meta
         finally:
@@ -767,17 +1078,22 @@ def _print_report(report: dict) -> None:
     print(f"engine      : Bing Images visual search  ({q['search_url']})")
     strength = q.get("match_strength")
     if strength:
-        note = ("pages using this exact image" if strength == "strong"
-                else "visually-similar / look-alike results only")
-        print(f"match type  : {strength.upper()}  ({note})")
-        print(f"scraped from: {q.get('result_source')}")
-    print(f"results     : {report['match_count']} page(s)")
+        note = {
+            "high": "exact_page - pages using this exact image",
+            "moderate": "visual_similarity only - no exact-image pages",
+            "none": "no usable results in either tier",
+        }.get(strength, strength)
+        print(f"match       : {strength.upper()}  ({note})")
+        print(f"tiers       : {q.get('exact_page_count', 0)} exact_page, "
+              f"{q.get('visual_similarity_count', 0)} visual_similarity")
+        print(f"source      : {q.get('result_source')}")
+    print(f"results     : {report['match_count']} candidate(s)")
     if q.get("bing_note"):
         print(f"bing note   : {q['bing_note']}")
     print()
 
     for m in report["matches"]:
-        print(f"  #{m['rank']:<2} {m['source_url']}")
+        print(f"  #{m['rank']:<2} [{m.get('match_type', '?')}]  {m['source_url']}")
         if m.get("title"):
             print(f"       {m['title']}")
 
@@ -861,10 +1177,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if report["match_count"] == 0:
         if meta.get("bing_note"):
-            log.warning('Bing found no pages with this image ("%s")  (exit %d)',
+            log.warning('No candidates - Bing card: "%s"  (exit %d)',
                         meta["bing_note"], EXIT_ZERO_MATCHES)
         else:
-            log.warning("No pages with matching images found  (exit %d)", EXIT_ZERO_MATCHES)
+            log.warning("No candidates in either tier (exact_page / visual_similarity)  "
+                        "(exit %d)", EXIT_ZERO_MATCHES)
             if not args.headed:
                 log.warning("Re-run with --headed - Bing serves degraded results to "
                             "headless browsers.")
@@ -872,8 +1189,9 @@ def main(argv: list[str] | None = None) -> int:
             log.info("Saved the page for inspection: %s", debug_dump)
         return EXIT_ZERO_MATCHES
 
-    log.info("face_search_fallback done: %d page(s), %s match  (exit 0)",
-             report["match_count"], meta.get("match_strength", "?"))
+    log.info("face_search_fallback done: %d candidate(s), match_strength=%s (%s)  (exit 0)",
+             report["match_count"], meta.get("match_strength", "?"),
+             meta.get("match_type", "?"))
     return EXIT_OK
 
 

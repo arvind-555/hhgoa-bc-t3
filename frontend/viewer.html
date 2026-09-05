@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HH Goa Task 3 — Trace Viewer</title>
+<style>
+  :root{
+    --bg:#0b0e14; --bg2:#0d1117; --card:#161b22; --card2:#1c2230;
+    --border:#2a313c; --border2:#3a434f;
+    --fg:#e6edf3; --muted:#8b949e; --faint:#6a7381;
+    --accent:#58a6ff;
+    --green:#3fb950; --green-bg:rgba(63,185,80,.13);
+    --amber:#d29922; --amber-bg:rgba(210,153,34,.14);
+    --red:#f85149;   --red-bg:rgba(248,81,73,.13);
+    --blue:#7ea2ff;  --blue-bg:rgba(126,162,255,.13);
+    --grey-bg:rgba(139,148,158,.12);
+    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+    line-height:1.5;font-size:15px;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:900px;margin:0 auto;padding:28px 20px 80px}
+
+  header h1{font-size:20px;margin:0 0 2px;letter-spacing:.2px}
+  header p{margin:0;color:var(--muted);font-size:13px}
+  .pickbar{margin:18px 0 26px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .filebtn{position:relative;overflow:hidden;display:inline-flex;align-items:center;gap:8px;
+    background:var(--card2);border:1px solid var(--border2);color:var(--fg);
+    padding:9px 14px;border-radius:8px;font-size:13.5px;cursor:pointer}
+  .filebtn:hover{border-color:var(--accent)}
+  .filebtn input{position:absolute;inset:0;opacity:0;cursor:pointer;font-size:0}
+  .fname{color:var(--muted);font-family:var(--mono);font-size:12.5px;
+    word-break:break-all}
+
+  .drop{border:1.5px dashed var(--border2);border-radius:12px;padding:40px 20px;
+    text-align:center;color:var(--muted);font-size:14px;background:var(--bg2)}
+  .drop.hot{border-color:var(--accent);color:var(--fg);background:var(--card)}
+  .drop code{font-family:var(--mono);color:var(--faint)}
+
+  .err{background:var(--red-bg);border:1px solid var(--red);border-radius:10px;
+    padding:14px 16px;color:#ffd7d4;font-family:var(--mono);font-size:13px;white-space:pre-wrap}
+
+  /* summary */
+  .summary{background:var(--card);border:1px solid var(--border);border-radius:14px;
+    padding:18px 20px;margin-bottom:22px}
+  .summary .top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;
+    flex-wrap:wrap}
+  .summary .img{font-family:var(--mono);font-size:13px;word-break:break-all}
+  .summary .meta{color:var(--faint);font-size:12px;margin-top:3px}
+  .outcome{font-size:13px;font-weight:600;padding:6px 12px;border-radius:999px;
+    white-space:nowrap;border:1px solid transparent}
+  .outcome .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+    margin-right:7px;vertical-align:middle}
+  .o-green{background:var(--green-bg);color:#7ee394;border-color:rgba(63,185,80,.35)}
+  .o-amber{background:var(--amber-bg);color:#e8c368;border-color:rgba(210,153,34,.35)}
+  .o-blue {background:var(--blue-bg); color:#a9c1ff;border-color:rgba(126,162,255,.35)}
+  .o-red  {background:var(--red-bg);  color:#ff9d97;border-color:rgba(248,81,73,.35)}
+  .o-grey {background:var(--grey-bg); color:var(--muted);border-color:var(--border2)}
+  .dot.green{background:var(--green)} .dot.amber{background:var(--amber)}
+  .dot.blue{background:var(--blue)} .dot.red{background:var(--red)}
+  .dot.grey{background:var(--faint)}
+  .summary .blurb{color:var(--muted);font-size:13px;margin-top:12px}
+
+  /* step rail */
+  .rail{margin:0 0 26px;padding:0;list-style:none}
+  .rail li{display:flex;gap:12px;padding:9px 0;border-bottom:1px solid var(--border)}
+  .rail li:last-child{border-bottom:0}
+  .rail .ic{flex:0 0 22px;height:22px;border-radius:50%;display:flex;align-items:center;
+    justify-content:center;font-size:12px;font-weight:700;margin-top:1px}
+  .ic.ok{background:var(--green-bg);color:var(--green)}
+  .ic.stopped{background:var(--amber-bg);color:var(--amber)}
+  .ic.skipped{background:var(--grey-bg);color:var(--faint)}
+  .ic.failed{background:var(--red-bg);color:var(--red)}
+  .ic.warn{background:var(--amber-bg);color:var(--amber)}
+  .rail .body{flex:1;min-width:0}
+  .rail .name{font-size:13.5px;font-weight:600}
+  .rail .name .n{color:var(--faint);font-weight:400;margin-right:6px}
+  .rail .detail{color:var(--muted);font-size:12.5px;word-break:break-word}
+
+  /* cards */
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;
+    padding:18px 20px;margin-bottom:18px}
+  .card > h2{font-size:12px;letter-spacing:1.4px;text-transform:uppercase;
+    color:var(--faint);margin:0 0 14px;font-weight:700}
+  .kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:13.5px}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0;word-break:break-word}
+  .mono{font-family:var(--mono);font-size:12.5px}
+
+  .facebox{display:flex;gap:20px;align-items:center;flex-wrap:wrap;margin-top:4px}
+  .facebox svg{flex:0 0 auto;background:var(--bg2);border:1px solid var(--border);
+    border-radius:8px}
+
+  .pill{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.5px;
+    padding:3px 9px;border-radius:6px;text-transform:uppercase;vertical-align:middle}
+  .pill.high{background:var(--green-bg);color:#7ee394}
+  .pill.moderate{background:var(--amber-bg);color:#e8c368}
+  .pill.none{background:var(--grey-bg);color:var(--muted)}
+  .pill.exact_page{background:var(--green-bg);color:#7ee394}
+  .pill.visual_similarity{background:var(--amber-bg);color:#e8c368}
+
+  .note{font-size:12.5px;padding:10px 12px;border-radius:8px;margin-top:12px}
+  .note.info{background:var(--blue-bg);color:#bccdff;border:1px solid rgba(126,162,255,.3)}
+  .note.warn{background:var(--amber-bg);color:#e8c368;border:1px solid rgba(210,153,34,.3)}
+  .note.muted{background:var(--grey-bg);color:var(--muted);border:1px solid var(--border)}
+
+  .cands{list-style:none;margin:14px 0 0;padding:0}
+  .cands li{padding:10px 0;border-top:1px solid var(--border);display:flex;gap:10px}
+  .cands li:first-child{border-top:0}
+  .cands .rank{flex:0 0 26px;color:var(--faint);font-family:var(--mono);font-size:12px;
+    text-align:right;padding-top:2px}
+  .cands .c-body{flex:1;min-width:0}
+  .cands .c-title{font-size:13.5px;margin-bottom:2px}
+  .cands .c-url{font-family:var(--mono);font-size:12px;color:var(--muted);
+    word-break:break-all}
+  .cands .c-host{color:var(--faint);font-size:12px}
+
+  .tx{font-family:var(--mono);font-size:12.5px;word-break:break-all;
+    background:var(--bg2);border:1px solid var(--border);border-radius:8px;
+    padding:10px 12px;margin-top:4px}
+  .btnlink{display:inline-flex;align-items:center;gap:6px;margin-top:12px;
+    background:var(--card2);border:1px solid var(--border2);border-radius:8px;
+    padding:8px 13px;font-size:13px}
+  .btnlink:hover{border-color:var(--accent);text-decoration:none}
+
+  details.raw{margin-top:24px}
+  details.raw summary{cursor:pointer;color:var(--muted);font-size:12.5px;
+    list-style:none;user-select:none}
+  details.raw summary::-webkit-details-marker{display:none}
+  details.raw summary::before{content:"▸ ";color:var(--faint)}
+  details.raw[open] summary::before{content:"▾ "}
+  details.raw pre{background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+    padding:16px;overflow:auto;font-family:var(--mono);font-size:12px;color:var(--muted);
+    max-height:460px}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>HH Goa Task 3 &mdash; Pipeline Trace Viewer</h1>
+    <p>Local, static viewer for the <code>trace_*.json</code> files the pipeline writes to <code>output/</code>. Nothing is uploaded &mdash; the file is read in your browser.</p>
+  </header>
+
+  <div class="pickbar">
+    <label class="filebtn">
+      <span>&#128193; Choose trace_*.json</span>
+      <input type="file" id="file" accept=".json,application/json">
+    </label>
+    <span class="fname" id="fname"></span>
+  </div>
+
+  <div id="drop" class="drop">
+    Drop a <code>trace_YYYYMMDD-HHMMSS.json</code> here, or use the button above.
+  </div>
+
+  <div id="err" class="err hidden"></div>
+  <div id="out"></div>
+</div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null) continue;
+    if (k === "class") n.className = v;
+    else if (k === "html") n.innerHTML = v;
+    else if (k === "text") n.textContent = v;
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids) if (kid != null) n.append(kid.nodeType ? kid : document.createTextNode(kid));
+  return n;
+};
+const hostOf = (u) => { try { return new URL(u).host; } catch { return ""; } };
+const short = (s, head = 10, tail = 8) =>
+  (typeof s === "string" && s.length > head + tail + 3) ? s.slice(0, head) + "…" + s.slice(-tail) : (s ?? "");
+const cleanTitle = (t) => (t || "").replace(/\s+Size:\s*\d+\s*[x×]\s*\d+.*$/i, "").trim();
+const fmtTime = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+};
+
+// ---------- file loading ----------
+$("file").addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+const drop = $("drop");
+["dragenter", "dragover"].forEach(ev => document.addEventListener(ev, (e) => {
+  e.preventDefault(); drop.classList.add("hot");
+}));
+["dragleave", "drop"].forEach(ev => document.addEventListener(ev, (e) => {
+  e.preventDefault();
+  if (ev === "dragleave" && e.relatedTarget) return;
+  drop.classList.remove("hot");
+}));
+document.addEventListener("drop", (e) => {
+  const f = e.dataTransfer && e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+
+function loadFile(file) {
+  $("fname").textContent = file.name;
+  $("err").classList.add("hidden");
+  const r = new FileReader();
+  r.onload = () => {
+    let data;
+    try { data = JSON.parse(r.result); }
+    catch (ex) { return showError("Could not parse JSON:\n" + ex.message); }
+    if (!data || typeof data !== "object") return showError("File does not contain a JSON object.");
+    try { render(data); }
+    catch (ex) { showError("Could not render trace:\n" + (ex && ex.stack || ex)); }
+  };
+  r.onerror = () => showError("Could not read the file.");
+  r.readAsText(file);
+}
+
+function showError(msg) {
+  $("out").innerHTML = "";
+  const e = $("err");
+  e.textContent = msg;
+  e.classList.remove("hidden");
+}
+
+// ---------- rendering ----------
+const OUTCOMES = {
+  complete:           ["o-green","green","Complete","Face traced to a candidate, notarized on-chain, and verified."],
+  "stopped-unfunded": ["o-blue","blue","Stopped — wallet unfunded","Steps 1–3 ran. Fund the Polygon Amoy wallet and re-run to notarize."],
+  "no-match":         ["o-amber","amber","No match found","The reverse image search returned nothing to notarize. This is a valid outcome, not an error."],
+  failed:             ["o-red","red","Failed","A pipeline step errored out — see the step details below."],
+  incomplete:         ["o-grey","grey","Incomplete","The trace ends before the pipeline finished (it was interrupted)."],
+};
+
+const STEP_IC = { ok:["ok","✓"], stopped:["stopped","■"], skipped:["skipped","–"],
+  failed:["failed","✕"], suspect_exact_page:["warn","!"] };
+
+function stepDetail(s) {
+  const d = { ...s }; delete d.step; delete d.name; delete d.status;
+  if (s.name === "face_encoder" && s.status === "ok")
+    return `${s.faces_detected} face(s) detected · encoding face #${s.face_index}`;
+  if (s.name === "face_search_fallback" && s.status === "ok")
+    return `${s.candidates} candidate(s) · ${s.exact_page ?? 0} exact_page + ${s.visual_similarity ?? 0} visual_similarity · strength: ${s.match_strength ?? "?"}`;
+  if (s.name === "face_search_fallback" && s.status === "suspect_exact_page")
+    return `exact_page tier rejected — ${Math.round((s.content_marketing_ratio || 0) * 100)}% content-marketing / listicle domains (${s.hosts || ""})`;
+  if (s.name === "extract" && s.status === "ok")
+    return `best candidate: [${s.match_type || "?"}] ${s.matched_url || ""}`;
+  if (s.status === "failed") return s.error || s.reason || "failed";
+  if (s.reason) return s.reason;
+  if (s.name === "chain_verify.upload_hash" && s.tx_hash) return `broadcast tx ${short(s.tx_hash)}`;
+  if (s.name === "chain_verify.verify" && s.matched) return "on-chain hash matches the matched post";
+  const rest = Object.entries(d).map(([k, v]) => `${k}=${v}`).join(" · ");
+  return rest || "—";
+}
+
+function render(t) {
+  $("err").classList.add("hidden");
+  drop.classList.add("hidden");
+  const out = $("out");
+  out.innerHTML = "";
+
+  const [ocls, odot, otitle, oblurb] = OUTCOMES[t.outcome] || OUTCOMES.incomplete;
+
+  // ---- summary ----
+  const sum = el("div", { class: "summary" });
+  sum.append(
+    el("div", { class: "top" },
+      el("div", {},
+        el("div", { class: "img", text: t.input_image || "(no input_image)" }),
+        el("div", { class: "meta", text: "started " + fmtTime(t.started_utc) }),
+      ),
+      el("span", { class: "outcome " + ocls },
+        el("span", { class: "dot " + odot }), otitle),
+    ),
+    el("div", { class: "blurb", text: oblurb }),
+  );
+  out.append(sum);
+
+  // ---- step rail ----
+  const steps = Array.isArray(t.steps) ? t.steps : [];
+  if (steps.length) {
+    const rail = el("ul", { class: "rail" });
+    for (const s of steps) {
+      const [icCls, icCh] = STEP_IC[s.status] || ["skipped", "·"];
+      rail.append(el("li", {},
+        el("span", { class: "ic " + icCls, text: icCh }),
+        el("div", { class: "body" },
+          el("div", { class: "name" },
+            el("span", { class: "n", text: "Step " + s.step }),
+            (s.name || "") + (s.status && s.status !== "ok" ? "  — " + s.status : "")),
+          el("div", { class: "detail", text: stepDetail(s) }),
+        ),
+      ));
+    }
+    out.append(rail);
+  }
+
+  // ---- step 1: face ----
+  if (t.face) {
+    const f = t.face, b = f.face_box || {};
+    const card = el("div", { class: "card" }, el("h2", { text: "1 · Face detection & encoding" }));
+    const dl = el("dl", { class: "kv" });
+    const row = (k, v) => { dl.append(el("dt", { text: k }), el("dd", {}, v)); };
+    row("faces detected", String(f.faces_detected ?? "?"));
+    row("face used", "#" + (f.face_index ?? 0));
+    row("encoding", (f.encoding_dim ?? "?") + "-d vector · detector: " + (f.model || "?"));
+    if (Object.keys(b).length) {
+      const wrap = el("div", { class: "facebox" });
+      wrap.append(faceBoxSvg(b));
+      wrap.append(el("div", { class: "mono" },
+        `box  left ${b.left}, top ${b.top}  →  right ${b.right}, bottom ${b.bottom}`,
+        el("br"),
+        `size  ${b.width ?? (b.right - b.left)} × ${b.height ?? (b.bottom - b.top)} px`));
+      dl.append(el("dt", { text: "face box" }), el("dd", {}, wrap));
+    }
+    if (f.source_image) row("source image", el("span", { class: "mono", text: f.source_image }));
+    if (f.source_sha256)
+      row("source sha-256", el("span", { class: "mono", text: f.source_sha256 }));
+    card.append(dl);
+    out.append(card);
+  }
+
+  // ---- step 2: search ----
+  if (t.search) {
+    const s = t.search;
+    const card = el("div", { class: "card" }, el("h2", { text: "2 · Reverse image search (Bing)" }));
+    const dl = el("dl", { class: "kv" });
+    const strength = s.match_strength || "none";
+    dl.append(el("dt", { text: "match strength" }),
+      el("dd", {}, el("span", { class: "pill " + strength, text: strength })));
+    dl.append(el("dt", { text: "tiers" }),
+      el("dd", { text: `${s.exact_page_count ?? 0} exact_page · ${s.visual_similarity_count ?? 0} visual_similarity` }));
+    if (s.result_source) { dl.append(el("dt", { text: "source" }), el("dd", { text: s.result_source })); }
+    card.append(dl);
+
+    if (s.bing_note)
+      card.append(el("div", { class: "note info", text: "Bing: “" + s.bing_note + "”" }));
+
+    const vmf = s.visual_matches_fallback;
+    if (vmf)
+      card.append(el("div", { class: "note muted",
+        text: `Visual Matches fallback — attempted: ${vmf.attempted}, tab found: ${vmf.tab_found}, landed: ${vmf.landed}, usable links: ${vmf.usable_links}` }));
+
+    if (s.exact_page_rejected) {
+      const r = s.exact_page_rejected;
+      card.append(el("div", { class: "note warn" },
+        `exact_page tier rejected — ${Math.round((r.ratio || 0) * 100)}% of those hits look like content-marketing / listicle sites (${r.hosts || ""}). Treated as visual_similarity instead of a false "exact page" match.`));
+    }
+
+    const cands = Array.isArray(s.candidates) ? s.candidates : [];
+    if (cands.length) {
+      card.append(el("div", { class: "mono", style: "color:var(--faint);margin-top:16px;font-size:12px",
+        text: cands.length + " candidate" + (cands.length === 1 ? "" : "s") }));
+      const ul = el("ul", { class: "cands" });
+      for (const c of cands) {
+        const mt = c.match_type || "?";
+        ul.append(el("li", {},
+          el("span", { class: "rank", text: "#" + (c.rank ?? "") }),
+          el("div", { class: "c-body" },
+            el("div", { class: "c-title" },
+              el("span", { class: "pill " + mt, text: mt.replace("_", " ") }),
+              " ",
+              cleanTitle(c.title) || "(untitled)"),
+            el("div", { class: "c-url" },
+              el("a", { href: c.source_url, target: "_blank", rel: "noopener", text: c.source_url }),
+              c.source_url ? el("span", { class: "c-host", text: "   " + hostOf(c.source_url) }) : null),
+          ),
+        ));
+      }
+      card.append(ul);
+    } else {
+      card.append(el("div", { class: "note muted", text: "No candidate links in either tier." }));
+    }
+    out.append(card);
+  }
+
+  // ---- step 3: matched post ----
+  {
+    const card = el("div", { class: "card" }, el("h2", { text: "3 · Matched post" }));
+    const mp = t.matched_post;
+    if (mp) {
+      const dl = el("dl", { class: "kv" });
+      const mt = mp.match_type || "?";
+      dl.append(el("dt", { text: "match type" }),
+        el("dd", {}, el("span", { class: "pill " + mt, text: mt.replace("_", " ") })));
+      dl.append(el("dt", { text: "matched url" }),
+        el("dd", {}, el("a", { href: mp.matched_url, target: "_blank", rel: "noopener",
+          class: "mono", text: mp.matched_url })));
+      if (mp.title) { dl.append(el("dt", { text: "title" }), el("dd", { text: cleanTitle(mp.title) })); }
+      if (mp.platform) { dl.append(el("dt", { text: "platform" }), el("dd", { text: mp.platform })); }
+      if (mp.discovered_via) { dl.append(el("dt", { text: "discovered via" }), el("dd", { text: mp.discovered_via })); }
+      card.append(dl);
+      if (mt !== "exact_page")
+        card.append(el("div", { class: "note warn",
+          text: "Best available candidate is visually-similar only — Bing did not find a page containing this exact image." }));
+    } else {
+      card.append(el("div", { class: "note muted",
+        text: "No matched post — there was nothing to notarize. The pipeline stopped here (this is a valid “no match” result, not a failure)." }));
+    }
+    out.append(card);
+  }
+
+  // ---- step 4/5: notarization ----
+  {
+    const card = el("div", { class: "card" }, el("h2", { text: "4–5 · Blockchain notarization (Polygon Amoy)" }));
+    const n = t.notarization;
+    if (n && n.broadcast) {
+      const dl = el("dl", { class: "kv" });
+      dl.append(el("dt", { text: "post hash" }), el("dd", {}, el("span", { class: "mono", text: n.hash })));
+      card.append(dl);
+      card.append(el("div", { class: "tx" }, "tx  " + (n.tx_hash || "")));
+      if (n.polygonscan_url)
+        card.append(el("a", { class: "btnlink", href: n.polygonscan_url, target: "_blank", rel: "noopener" },
+          "View transaction on Polygonscan ↗"));
+      const v = t.verified;
+      const vnote = v === true
+        ? ["note info", "✓ Verified on-chain — the post hash pulled back from the transaction matches the matched post."]
+        : v === false
+          ? ["note warn", "✕ Mismatch — the on-chain hash does not match. (Should be impossible right after upload.)"]
+          : ["note muted", "Verification step did not run."];
+      card.append(el("div", { class: vnote[0], text: vnote[1] }));
+    } else if (n && !n.broadcast) {
+      card.append(el("div", { class: "note info" },
+        "Not broadcast. " + (n.reason || "The wallet could not cover gas.") +
+        " The hash was computed but no transaction was sent — fund the wallet and re-run."));
+      if (n.hash) card.append(el("div", { class: "tx" }, "post hash  " + n.hash + "  (not yet on-chain)"));
+    } else {
+      card.append(el("div", { class: "note muted",
+        text: "The blockchain step was not reached — the pipeline stopped earlier." }));
+    }
+    out.append(card);
+  }
+
+  // ---- raw ----
+  const raw = el("details", { class: "raw" });
+  raw.append(el("summary", { text: "raw trace JSON" }),
+    el("pre", { text: JSON.stringify(t, null, 2) }));
+  out.append(raw);
+
+  window.scrollTo(0, 0);
+}
+
+function faceBoxSvg(b) {
+  // schematic only - the trace has box coords but not the image dimensions,
+  // so we assume a canvas a little larger than the box's extent.
+  const W = 108, H = 108, pad = 6;
+  const cw = Math.max(b.right, 1) * 1.15, ch = Math.max(b.bottom, 1) * 1.15;
+  const sx = (W - 2 * pad) / cw, sy = (H - 2 * pad) / ch;
+  const x = pad + b.left * sx, y = pad + b.top * sy;
+  const w = Math.max((b.right - b.left) * sx, 2), h = Math.max((b.bottom - b.top) * sy, 2);
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const frame = document.createElementNS(ns, "rect");
+  frame.setAttribute("x", pad - 3); frame.setAttribute("y", pad - 3);
+  frame.setAttribute("width", W - 2 * (pad - 3)); frame.setAttribute("height", H - 2 * (pad - 3));
+  frame.setAttribute("fill", "none"); frame.setAttribute("stroke", "#2a313c");
+  frame.setAttribute("stroke-dasharray", "3 3"); frame.setAttribute("rx", "4");
+  const box = document.createElementNS(ns, "rect");
+  box.setAttribute("x", x); box.setAttribute("y", y);
+  box.setAttribute("width", w); box.setAttribute("height", h);
+  box.setAttribute("fill", "rgba(88,166,255,.18)"); box.setAttribute("stroke", "#58a6ff");
+  box.setAttribute("stroke-width", "1.5"); box.setAttribute("rx", "2");
+  svg.append(frame, box);
+  return svg;
+}
+</script>
+</body>
+</html>
