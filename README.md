@@ -3,16 +3,19 @@
 Face scan -> web/social search for a matching post -> blockchain upload +
 re-verification of the discovered data.
 
-**Status:** building in pieces.
+**Status:** complete, verified live end-to-end.
 - [x] Piece 1 - detect + encode a face from an input image
 - [x] Piece 2 - reverse image search (Bing visual search via Playwright; Lenso.ai
-      API path exists but its tier is out of budget)
+      API ruled out - their Developer tier runs ~$2,400/month, not viable for a
+      hackathon)
 - [x] Piece 3 - Polygon Amoy access (`chain_setup.py`)
 - [x] Piece 5 - hash notarize + tamper-verify (`chain_verify.py`)
 - [x] Piece 6 - one-command pipeline (`src/main.py`)
+- [x] Local trace-viewer frontend (`frontend/viewer.html`)
 
-Live broadcast (steps 4-5 of the pipeline) is pending a funded wallet -
-everything up to it is written and tested.
+Wallet is funded and the full pipeline has been run live end-to-end, including
+a genuine on-chain notarization and verification. Example transaction:
+<https://amoy.polygonscan.com/tx/0x27769f5cc7d59caa8b22717aadaecad87253041ebbd3b94d9ad006388261a341>
 
 ## Architecture (locked)
 
@@ -361,6 +364,14 @@ network touched (the Playwright import is lazy). The real check is the manual
   invents matches.
 - Scrapes only the public result links Bing renders; login-walled or
   JS-deferred results below the fold may be missed.
+- **Social platforms often block indexing of their own hosted images**
+  (confirmed directly: a photo saved straight from a LinkedIn profile, never
+  modified, never returns an `exact_page` match on Bing). This is a deliberate
+  crawler restriction on the platform's side, not a bug in this scraper - the
+  same photo *does* get correctly matched when it's hosted somewhere Bing can
+  crawl (verified with a stock photo indexed on nike.com). Practically: an
+  `exact_page` hit for a personal photo is far more likely off a personal
+  blog, GitHub, or forum post than off Instagram/LinkedIn/Facebook.
 
 ---
 
@@ -479,9 +490,15 @@ The live broadcast is exercised by hand once the wallet is funded.
 
 ### Status
 
-Wallet `0x670D925B49F2188749FE390CE37654Ef69c51f05` is **unfunded** - everything
-up to the broadcast call is written and tested; the live broadcast + on-chain
-`verify()` round-trip get tested once POL lands from the faucet.
+Wallet `0x670D925B49F2188749FE390CE37654Ef69c51f05` is **funded** (0.2 POL) and
+the full broadcast + on-chain `verify()` round-trip have been run live against
+Polygon Amoy. Example transaction:
+<https://amoy.polygonscan.com/tx/0x27769f5cc7d59caa8b22717aadaecad87253041ebbd3b94d9ad006388261a341>
+- `verify()` confirmed the on-chain hash matches the original post data
+  (`matched: true`).
+- The tamper-detection demo (`demo_tamper_verify.py`) confirms the same
+  transaction correctly **fails** verification once the underlying post data
+  is altered - proof the on-chain record is load-bearing, not decorative.
 
 ---
 
